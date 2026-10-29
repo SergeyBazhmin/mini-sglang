@@ -1,0 +1,18 @@
+[project]
+name = "nano-serve"
+version = "0.1.0"
+description = "A toy LLM serving engine for learning how SGLang works"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "transformers>=4.51", # Qwen3 support
+    "fastapi",
+    "uvicorn",
+    "pyzmq",
+    "openai",
+]
+
+[tool.uv]
+# Plain scripts, not an installable package.
+package = false
