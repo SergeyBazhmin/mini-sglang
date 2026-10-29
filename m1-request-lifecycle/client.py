@@ -1,6 +1,6 @@
 """Checks for M1, using the official OpenAI client.
 
-    python client.py --port 8000
+    uv run m1-request-lifecycle/client.py --port 8000
 
 1. Streaming works.
 2. Non-ASCII output streams without the "�" character.

@@ -14,7 +14,7 @@ Process layout (the same ring as SGLang):
               ^                                                        |
               +----------------------------PULL------------------------+
 
-Run:  python server.py --model Qwen/Qwen3-0.6B --port 8000
+Run:  uv run m1-request-lifecycle/server.py --model Qwen/Qwen3-0.6B --port 8000
 """
 
 import argparse
