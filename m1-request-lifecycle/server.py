@@ -17,7 +17,6 @@ Process layout (the same ring as SGLang):
 Run:  uv run m1-request-lifecycle/server.py --model Qwen/Qwen3-0.6B --port 8000
 """
 
-import argparse
 import asyncio
 import dataclasses
 import json
@@ -25,13 +24,15 @@ import multiprocessing as mp
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Annotated, Any, AsyncIterator, Dict, List, Optional
 
+import typer
 import uvicorn
 import zmq
 import zmq.asyncio
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
+from loguru import logger
 from pydantic import BaseModel
 from transformers import AutoTokenizer
 
@@ -41,6 +42,7 @@ from common import (
     PortArgs,
     TokenizedGenerateReq,
     get_socket,
+    setup_logging,
 )
 from detokenizer import run_detokenizer_process
 from scheduler import run_scheduler_process
@@ -261,37 +263,43 @@ async def _stream_chunks(
 # ---------------------------------------------------------------------------
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
-    args = parser.parse_args()
-
+def main(
+    model: Annotated[
+        str, typer.Option(help="HF model id or local path.")
+    ] = "Qwen/Qwen3-0.6B",
+    host: Annotated[str, typer.Option(help="Address to listen on.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option(help="Port to listen on.")] = 8000,
+):
+    """Launch nano-serve: HTTP server + scheduler + detokenizer processes."""
+    setup_logging("main")
     port_args = PortArgs.new()
+    logger.info(f"IPC addresses: {port_args}")
 
     # "spawn", not "fork": a forked child cannot safely initialize CUDA.
     mp_ctx = mp.get_context("spawn")
     reader, writer = mp_ctx.Pipe(duplex=False)
     scheduler_proc = mp_ctx.Process(
         target=run_scheduler_process,
-        args=(args.model, port_args, writer),
+        args=(model, port_args, writer),
         daemon=True,
     )
     detokenizer_proc = mp_ctx.Process(
-        target=run_detokenizer_process, args=(args.model, port_args), daemon=True
+        target=run_detokenizer_process, args=(model, port_args), daemon=True
     )
     scheduler_proc.start()
     detokenizer_proc.start()
 
     # Block until the model is loaded, so the first request isn't stuck.
+    logger.info(f"Waiting for the scheduler to load {model} ...")
     msg = reader.recv()
     if msg != "ready":
-        raise SystemExit(f"Scheduler failed to start:\n{msg}")
+        logger.error(f"Scheduler failed to start:\n{msg}")
+        raise SystemExit(1)
 
-    tm = TokenizerManager(args.model, port_args)
-    uvicorn.run(build_app(tm, args.model), host=args.host, port=args.port)
+    tm = TokenizerManager(model, port_args)
+    logger.info(f"Serving on http://{host}:{port}")
+    uvicorn.run(build_app(tm, model), host=host, port=port)
 
 
 if __name__ == "__main__":
-    main()
+    typer.run(main)

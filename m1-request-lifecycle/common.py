@@ -7,10 +7,25 @@ SGLang equivalents:
 """
 
 import dataclasses
+import sys
 import tempfile
 from typing import List, Optional
 
 import zmq
+from loguru import logger
+
+
+def setup_logging(proc_name: str):
+    """Call once at the start of each process. Tags every line with the process name."""
+    logger.remove()
+    logger.configure(extra={"proc": proc_name})
+    logger.add(
+        sys.stderr,
+        format=(
+            "<green>{time:HH:mm:ss.SSS}</green> | <level>{level: <7}</level> | "
+            "<cyan>{extra[proc]: <11}</cyan> | <level>{message}</level>"
+        ),
+    )
 
 # ---------------------------------------------------------------------------
 # IPC addresses

@@ -12,12 +12,12 @@ batching) mostly changes "pick work" and "run one step".
 """
 
 import collections
-import logging
 import traceback
 from typing import Deque, List, Optional, Set
 
 import torch
 import zmq
+from loguru import logger
 from transformers import AutoModelForCausalLM
 
 from common import (
@@ -26,9 +26,8 @@ from common import (
     PortArgs,
     TokenizedGenerateReq,
     get_socket,
+    setup_logging,
 )
-
-logger = logging.getLogger("scheduler")
 
 # How many prompt tokens to send to the detokenizer as decoding context.
 # SGLang: INIT_INCREMENTAL_DETOKENIZATION_OFFSET in schedule_batch.py.
@@ -206,7 +205,7 @@ class Scheduler:
 
 
 def run_scheduler_process(model_path: str, port_args: PortArgs, ready_pipe):
-    logging.basicConfig(level=logging.INFO, format="[scheduler] %(message)s")
+    setup_logging("scheduler")
     try:
         scheduler = Scheduler(model_path, port_args)
     except Exception:

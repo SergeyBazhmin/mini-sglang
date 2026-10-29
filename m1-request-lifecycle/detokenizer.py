@@ -13,15 +13,13 @@ So we decode a window, ids[surr:read] and ids[surr:], and emit the difference.
 """
 
 import dataclasses
-import logging
 from typing import Dict, List
 
 import zmq
+from loguru import logger
 from transformers import AutoTokenizer
 
-from common import BatchStrOut, BatchTokenIDOut, PortArgs, get_socket
-
-logger = logging.getLogger("detokenizer")
+from common import BatchStrOut, BatchTokenIDOut, PortArgs, get_socket, setup_logging
 
 
 @dataclasses.dataclass
@@ -98,5 +96,7 @@ class Detokenizer:
 
 
 def run_detokenizer_process(model_path: str, port_args: PortArgs):
-    logging.basicConfig(level=logging.INFO, format="[detokenizer] %(message)s")
-    Detokenizer(model_path, port_args).event_loop()
+    setup_logging("detokenizer")
+    detokenizer = Detokenizer(model_path, port_args)
+    logger.info("Ready")
+    detokenizer.event_loop()

@@ -8,10 +8,11 @@
    first; look at the timings. M2 (continuous batching) fixes this.
 """
 
-import argparse
 import asyncio
 import time
+from typing import Annotated
 
+import typer
 from openai import AsyncOpenAI
 
 # Qwen3 thinks by default. Turn it off so the outputs are short and easy to read.
@@ -44,11 +45,8 @@ async def stream_one(client, model, prompt, max_tokens=200, echo=True):
     return "".join(text), first_token_at, time.perf_counter() - start
 
 
-async def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8000)
-    args = parser.parse_args()
-    client = AsyncOpenAI(base_url=f"http://127.0.0.1:{args.port}/v1", api_key="EMPTY")
+async def run_checks(port: int):
+    client = AsyncOpenAI(base_url=f"http://127.0.0.1:{port}/v1", api_key="EMPTY")
     model = (await client.models.list()).data[0].id
 
     print("=== 1. streaming ===")
@@ -70,5 +68,12 @@ async def main():
     print("In v0, one request's TTFT is about the other's total time. M2 fixes that.")
 
 
+def main(
+    port: Annotated[int, typer.Option(help="Port nano-serve is listening on.")] = 8000,
+):
+    """Run the M1 checks against a running nano-serve server."""
+    asyncio.run(run_checks(port))
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    typer.run(main)
