@@ -9,6 +9,7 @@ so you can diff two chapters to see exactly what changed.
 | chapter | topic |
 |---|---|
 | [`m1-request-lifecycle`](m1-request-lifecycle/) | processes, ZMQ ring, streaming, incremental detokenization |
+| [`m2-continuous-batching`](m2-continuous-batching/) | prefill/decode batches, requests joining and leaving every step, batched sampling |
 
 ## Setup
 
