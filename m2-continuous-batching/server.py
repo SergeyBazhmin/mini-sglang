@@ -43,6 +43,7 @@ from transformers import AutoTokenizer
 from common import (
     AbortReq,
     BatchStrOut,
+    SchedulerOptions,
     PortArgs,
     TokenizedGenerateReq,
     get_socket,
@@ -306,18 +307,26 @@ def main(
     max_prefill_tokens: Annotated[
         int, typer.Option(help="Prompt-token budget of one prefill batch (SGLang: --max-prefill-tokens).")
     ] = 8192,
+    decode_first: Annotated[
+        bool, typer.Option(help="Admit new requests only when the batch is empty.")
+    ] = False,
+    stream_interval: Annotated[
+        int, typer.Option(help="Stream every N tokens (SGLang: --stream-interval).")
+    ] = 1,
 ):
     """Launch nano-serve: HTTP server + scheduler + detokenizer processes."""
     setup_logging("main")
     port_args = PortArgs.new()
     logger.info(f"IPC addresses: {port_args}")
+    options = SchedulerOptions(decode_first, stream_interval)
+    logger.info(f"Scheduler options: {options}")
 
     # "spawn", not "fork": a forked child cannot safely initialize CUDA.
     mp_ctx = mp.get_context("spawn")
     reader, writer = mp_ctx.Pipe(duplex=False)
     scheduler_proc = mp_ctx.Process(
         target=run_scheduler_process,
-        args=(model, port_args, max_running_requests, max_prefill_tokens, writer),
+        args=(model, port_args, max_running_requests, max_prefill_tokens, options, writer),
         daemon=True,
     )
     detokenizer_proc = mp_ctx.Process(

@@ -45,7 +45,7 @@ class ForwardBatch:
 
 
 class GatherTimer:
-    """Exercise 3: time spent in _run_decode's gathers, added up over all layers."""
+    """Time spent in _run_decode's gathers, added up over all layers."""
 
     def __init__(self, device: str):
         self.device = device
@@ -143,7 +143,7 @@ class PoolAttention(nn.Module):
         return torch.cat(outputs)
 
     def _run_extend_batched(self, q: torch.Tensor, fb: ForwardBatch) -> torch.Tensor:
-        """Exercise 2: one attention call for all new requests, the way _run_decode works.
+        """--batched-prefill: one attention call for all new requests, the way _run_decode works.
 
         Padding brings M2's rectangle back, inside attention only. The cost is
         O(batch * max_len^2), so one long prompt makes every short one pay for

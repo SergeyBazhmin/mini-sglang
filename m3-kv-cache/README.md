@@ -25,17 +25,17 @@ integers.
 | `model_runner.py` | Flat batches with no padding, slot allocation, `free_req`, pool sizing | `managers/schedule_batch.py` (`prepare_for_extend`/`prepare_for_decode`), `mem_cache/common.py` (`release_kv_cache`), `model_executor/pool_configurator.py` |
 | `scheduler.py` | Token budget at admission, oversized requests rejected or clamped, token usage in the logs | `managers/schedule_policy.py` (`PrefillAdder`), `managers/scheduler.py` |
 | `server.py` | `--max-total-tokens`, `--mem-fraction-static`, `--context-length` | `server_args.py` |
-| `test/test_memory_pool.py` | **new.** Allocator and table unit checks, no model needed | `test/registered/unit/mem_cache/` |
-| `test/test_batching.py` | Compares with a separate HF model, requests leave at different steps, two passes over recycled slots, one retraction | `test/registered/...` accuracy tests |
-| `test/test_scheduler.py`, `test/test_attention.py` | **new.** Retraction, page accounting, double frees and padded prefill, no download needed | `test/registered/unit/` |
-| `prefill_cost.py`, `read_cost.py`, `alloc_cost.py` | **new.** The measurements for exercises 2 to 5 | |
-| `common.py` | `ExerciseOptions` | |
+| `tests/test_memory_pool.py` | **new.** Allocator and table unit checks, no model needed | `test/registered/unit/mem_cache/` |
+| `tests/test_batching.py` | Compares with a separate HF model, requests leave at different steps, two passes over recycled slots, one retraction | `test/registered/...` accuracy tests |
+| `tests/test_scheduler.py`, `tests/test_attention.py` | **new.** Retraction, page accounting, double frees and padded prefill, no download needed | `test/registered/unit/` |
+| `prefill_cost.py`, `read_cost.py`, `alloc_cost.py` | **new.** Measurements, see [Options](#options) | |
+| `common.py` | `EngineOptions` | |
 | `client.py`, `bench.py`, `detokenizer.py` | unchanged (docstrings only) | |
 
-`diff -r -x exercises m2-continuous-batching m3-kv-cache` shows all of it. This
-chapter has its exercises built in, behind the switches listed under
-[Exercises](#exercises). With no flags, the server reserves and allocates as
-described below.
+`diff -r m2-continuous-batching m3-kv-cache` shows all of it. M3 starts from M2's
+plain continuous batching: `--decode-first` and `--stream-interval` are not
+carried over. The features under [Options](#options) are switches. With
+no flags, the server reserves and allocates as described below.
 
 ## Read in SGLang first
 
@@ -93,18 +93,15 @@ memory behaviour, and by a smaller margin on throughput.
 
 M3 can also be **slower** than M2 at prefill when many requests arrive together,
 because `_run_extend` runs one attention per request per layer (`--batched-prefill`
-is the fix, see exercise 2).
+is the fix, see [Faster prefill](#faster-prefill)).
 
 ## Run (GPU machine)
 
 From the repo root:
 
 ```bash
-uv run m3-kv-cache/test/test_memory_pool.py
-uv run m3-kv-cache/test/test_scheduler.py
-uv run m3-kv-cache/test/test_attention.py
-uv run m3-kv-cache/test/test_batching.py --model Qwen/Qwen3-0.6B
-uv run m3-kv-cache/test/test_batching.py --model Qwen/Qwen3-0.6B --batched-prefill --page-size 64 --lazy-free
+uv run pytest m3-kv-cache                                  # No model needed.
+uv run pytest m3-kv-cache -m model --model Qwen/Qwen3-0.6B # With and without the option flags.
 uv run m3-kv-cache/server.py --model Qwen/Qwen3-0.6B --port 8000
 # another shell:
 uv run m3-kv-cache/client.py --port 8000
@@ -118,8 +115,8 @@ uv run m3-kv-cache/bench.py --port 8000 --num-requests 32 --concurrency 32
 Qwen3 only, for now: `PoolAttention` reuses HF's Qwen3 projections and norms.
 
 ## Done when
-1. `test/test_memory_pool.py`, `test/test_scheduler.py` and `test/test_attention.py` pass.
-2. `test/test_batching.py`, with and without the exercise flags, matches on every
+1. `tests/test_memory_pool.py`, `tests/test_scheduler.py` and `tests/test_attention.py` pass.
+2. `tests/test_batching.py`, with and without the option flags, matches on every
    prompt in both passes (exactly on CPU; on
    GPU bf16, divergence late in a sequence is expected, see its docstring),
    reports all slots free, and memory did not grow.
@@ -130,28 +127,27 @@ Qwen3 only, for now: `PoolAttention` reuses HF's Qwen3 projections and norms.
 6. M2 vs M3 tokens/s, at `--max-tokens 256` and `--max-tokens 1024`. Write down
    all four numbers.
 
-## Exercises
+## Options
 
-All six are done and built into this chapter. Each section gives the task, then
-the solution and how to measure it.
+Each section gives the problem, the solution and how to measure it.
 
-| exercise | switch | changed | measured with |
+| feature | switch | code | measured with |
 |---|---|---|---|
-| 1. Overcommit and retract | `--new-token-ratio R` | `Req.remaining_kv_tokens`, `Scheduler.update_running_batch`, `ModelRunner._prepare_extend` | `bench.py` and the scheduler log |
-| 2. Faster prefill | `--batched-prefill` | `PoolAttention._run_extend_batched` | `prefill_cost.py` |
-| 3. Measure the read copy | none (standalone) | `GatherTimer` in `attention.py` | `read_cost.py` |
-| 4. Pages | `--page-size N` | `TokenAllocator`, `ModelRunner._prepare_decode`, `decode_slots_needed` | `alloc_cost.py` and `page waste` in the log |
-| 5. Allocator cost | `--lazy-free` | `TokenAllocator.free`, `merge_released` | `alloc_cost.py` |
-| 6. Double free | `--check-double-free` | `ModelRunner.free_req`, `TokenAllocator._mark_free` | `test/test_memory_pool.py`, `test/test_scheduler.py` |
+| Overcommit and retract | `--new-token-ratio R` | `Req.remaining_kv_tokens`, `Scheduler.update_running_batch`, `ModelRunner._prepare_extend` | `bench.py` and the scheduler log |
+| Faster prefill | `--batched-prefill` | `PoolAttention._run_extend_batched` | `prefill_cost.py` |
+| Measure the read copy | none (standalone) | `GatherTimer` in `attention.py` | `read_cost.py` |
+| Pages | `--page-size N` | `TokenAllocator`, `ModelRunner._prepare_decode`, `decode_slots_needed` | `alloc_cost.py` and `page waste` in the log |
+| Allocator cost | `--lazy-free` | `TokenAllocator.free`, `merge_released` | `alloc_cost.py` |
+| Double free | `--check-double-free` | `ModelRunner.free_req`, `TokenAllocator._mark_free` | `tests/test_memory_pool.py`, `tests/test_scheduler.py` |
 
-### 1. Overcommit and retract
+### Overcommit and retract
 
-*Task: our reservation is safe but wasteful, because most requests hit EOS early.
-Admit with `max_new_tokens * ratio`, for `ratio` around 0.5. Before each decode,
-check that the step fits. If not, push the request with the most remaining work
-back to the queue and free its slots. It must re-prefill `input_ids + output_ids`.
-Compare token usage and throughput. Read `update_running_batch` (scheduler.py
-~4550) and `new_token_ratio_tracker.py` first.*
+The full reservation is safe but wasteful, because most requests hit EOS early.
+`--new-token-ratio R` admits with `max_new_tokens * R`. Before each decode, the
+scheduler checks that the step fits. If not, it pushes the request with the most
+remaining work back to the queue and frees its slots, and that request
+re-prefills `input_ids + output_ids` later. SGLang: `update_running_batch`
+(scheduler.py ~4550) and `new_token_ratio_tracker.py`.
 
 ```bash
 # Run with --new-token-ratio 1, then 0.5, then 0.2.
@@ -186,17 +182,16 @@ Differences from SGLang:
 - **The ratio is fixed here.** SGLang's `NewTokenRatioTracker` starts at
   `init` (0.7 by default), decays on every step without retraction, and jumps to
   an estimate from the retracted requests when retraction happens. Good next step.
-- **Who gets retracted differs.** We follow the exercise and pick the most
-  remaining work. Read `_get_decode_retraction_order` in `schedule_batch.py`, which
+- **Who gets retracted differs.** We pick the most remaining work. Read `_get_decode_retraction_order` in `schedule_batch.py`, which
   sorts by output and prompt length, and has a priority mode.
 - **SGLang doesn't retract when a finishing request is about to free KV.** That
   only matters with the overlap loop (M6), where results arrive a step late.
 
-### 2. Faster prefill
+### Faster prefill
 
-*Task: vectorize `_run_extend` the way `_run_decode` works, with a padded gather
-and a mask combining "causal" and "within this request". Measure a burst of 32 new
-requests, before and after.*
+`--batched-prefill` vectorizes `_run_extend` the way `_run_decode` works, with a
+padded gather and a mask combining "causal" and "within this request".
+`prefill_cost.py` measures a burst of 32 new requests both ways.
 
 ```bash
 uv run m3-kv-cache/prefill_cost.py --model Qwen/Qwen3-0.6B
@@ -208,12 +203,12 @@ should go. Try `--prompt-len 64` and `--prompt-len 1024` too. Real kernels get t
 same gain without padding, which is M5.
 
 Results may differ from the loop by floating-point noise, because a different
-batch shape can take a different code path. `test/test_attention.py` allows for that.
+batch shape can take a different code path. `tests/test_attention.py` allows for that.
 
-### 3. Measure the read copy
+### Measure the read copy
 
-*Task: time the two gathers in `_run_decode` against the whole step, at context
-lengths 128, 1024 and 4096.*
+`GatherTimer` times the two gathers in `_run_decode` against the whole step, at
+context lengths 128, 1024 and 4096.
 
 ```bash
 uv run m3-kv-cache/read_cost.py --model Qwen/Qwen3-0.6B
@@ -223,11 +218,10 @@ Gather time should grow linearly with context, since `MB read` does. Its share o
 the step tells you how much M5 can win. It may grow more slowly than you expect,
 because attention itself also reads every cached token: that part stays after M5.
 
-### 4. Pages
+### Pages
 
-*Task: make the allocator hand out 64 slots at a time, so a request only needs a
-new page every 64 tokens. What share of slots goes unused on average? What gets
-faster? Read `alloc_extend_naive` first.*
+`--page-size 64` makes the allocator hand out 64 slots at a time, so a request only
+needs a new page every 64 tokens. SGLang: `alloc_extend_naive`.
 
 ```bash
 uv run m3-kv-cache/alloc_cost.py
@@ -255,10 +249,10 @@ SGLang's `alloc_extend_naive` also handles a request that starts mid-page, which
 matters once a cached prefix ends there (M4). Ours always starts a fresh row at
 position 0.
 
-### 5. Allocator cost
+### Allocator cost
 
-*Task: `free` copies the whole free list. Replace it with SGLang's `release_pages`
-idea: buffer frees, and merge only when `alloc` runs short.*
+By default `free` copies the whole free list. `--lazy-free` follows SGLang's
+`release_pages` idea instead: buffer frees, and merge only when `alloc` runs short.
 
 ```bash
 uv run m3-kv-cache/alloc_cost.py
@@ -277,16 +271,15 @@ Differences from SGLang: its `release_pages` is the sort path. It exists so that
 again, not to save a copy, and its base `free` still runs `torch.cat` on the
 buffer. The paged allocator's `staged_pages` is closer to ours. We don't sort, so
 over time a request's slots scatter. That costs us nothing with page size 1, but
-try adding the sort and measuring it.
+sorting is worth measuring as a next step.
 
-### 6. Double free
+### Double free
 
-*Task: call `free_req` twice on the same request in a test. What happens, and what
-breaks later? Add a check that catches it at the first call.*
+What happens if `free_req` runs twice on the same request, and how to catch it at
+the first call.
 
 ```bash
-uv run m3-kv-cache/test/test_memory_pool.py
-uv run m3-kv-cache/test/test_scheduler.py
+uv run pytest m3-kv-cache
 ```
 
 **What happened before the check.** `free_req` clears `req_pool_idx`, so a second

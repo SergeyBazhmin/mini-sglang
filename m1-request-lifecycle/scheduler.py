@@ -9,6 +9,8 @@ SGLang equivalent: python/sglang/srt/managers/scheduler.py
 v0 runs ONE request at a time. The loop is already shaped like SGLang's
 (ingest -> pick work -> run one step -> stream output), so M2 (continuous
 batching) mostly changes "pick work" and "run one step".
+
+--stream-interval N sends output only every N tokens, as SGLang's does.
 """
 
 import collections
@@ -46,6 +48,7 @@ class Req:
 
         self.output_ids: List[int] = []
         self.num_sent = 0  # How many output_ids were already streamed out.
+        self.num_messages = 0  # How many messages went to the detokenizer.
         self.finish_reason: Optional[str] = None
 
         # The KV cache. v0 uses HF's own cache object, one per request.
@@ -73,7 +76,8 @@ def sample(logits: torch.Tensor, temperature: float, top_p: float) -> int:
 
 
 class Scheduler:
-    def __init__(self, model_path: str, port_args: PortArgs):
+    def __init__(self, model_path: str, port_args: PortArgs, stream_interval: int = 1):
+        self.stream_interval = stream_interval
         context = zmq.Context(2)
         self.recv_from_tokenizer = get_socket(
             context, zmq.PULL, port_args.scheduler_input, bind=True
@@ -145,15 +149,23 @@ class Scheduler:
                 raise ValueError(f"Unknown request type: {type(recv_req)}")
 
     def abort_request(self, rid: str):
+        """The main process noticed the client disconnect first: Starlette cancels
+        the response, and TokenizerManager.generate_request sends AbortReq."""
         for req in self.waiting_queue:
             if req.rid == rid:
                 self.waiting_queue.remove(req)
                 # Never started, so the detokenizer has no state for it.
+                logger.info(f"Abort {rid[:8]}: removed from the queue")
                 return
         if self.running_req is not None and self.running_req.rid == rid:
             # Stop it on the next loop iteration. stream_output still sends a
             # final message so the detokenizer frees its state.
             self.running_req.finish_reason = "abort"
+            logger.info(
+                f"Abort {rid[:8]}: stopped after {len(self.running_req.output_ids)} tokens"
+            )
+            return
+        logger.info(f"Abort {rid[:8]}: already finished")
 
     # -------------------------------------------------------------- forward
 
@@ -182,16 +194,26 @@ class Scheduler:
     # --------------------------------------------------------------- output
 
     def stream_output(self, req: Req):
-        """Send new token ids to the detokenizer. Sent after every token in v0.
+        """Send new token ids to the detokenizer.
 
-        SGLang batches outputs for all running requests into one message and
-        can send only every `stream_interval` tokens.
+        With stream_interval N, a request is sent once N tokens are unsent. Its
+        first token still goes out at once, or TTFT would pay for the interval,
+        and a finished request always flushes. SGLang: OutputStreamer, which also
+        batches outputs for all running requests into one message.
         """
         new_ids = req.output_ids[req.num_sent :]
-        if not new_ids and req.finish_reason is None:
-            return
         is_first = req.num_sent == 0
+        if req.finish_reason is None and (
+            not new_ids or (not is_first and len(new_ids) < self.stream_interval)
+        ):
+            return
         req.num_sent = len(req.output_ids)
+        req.num_messages += 1
+        if req.finish_reason is not None:
+            logger.info(
+                f"Finished {req.rid[:8]} ({req.finish_reason}): "
+                f"{len(req.output_ids)} tokens in {req.num_messages} messages"
+            )
 
         self.send_to_detokenizer.send_pyobj(
             BatchTokenIDOut(
@@ -204,10 +226,12 @@ class Scheduler:
         )
 
 
-def run_scheduler_process(model_path: str, port_args: PortArgs, ready_pipe):
+def run_scheduler_process(
+    model_path: str, port_args: PortArgs, stream_interval: int, ready_pipe
+):
     setup_logging("scheduler")
     try:
-        scheduler = Scheduler(model_path, port_args)
+        scheduler = Scheduler(model_path, port_args, stream_interval)
     except Exception:
         ready_pipe.send(traceback.format_exc())
         raise

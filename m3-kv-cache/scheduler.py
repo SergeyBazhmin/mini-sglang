@@ -29,7 +29,7 @@ slots. It also wastes capacity, because most requests stop at EOS long before
 that. SGLang's PrefillAdder (schedule_policy.py ~line 605) overcommits instead
 and handles the overflow.
 
-So does this scheduler with --new-token-ratio below 1 (exercise 1): it reserves
+So does this scheduler with --new-token-ratio below 1: it reserves
 only that share of each request's new tokens. If a decode step then doesn't fit,
 update_running_batch retracts requests: it frees their KV and puts them back at
 the head of the queue. Their output so far is kept, and they prefill it again.
@@ -47,7 +47,7 @@ from loguru import logger
 from common import (
     AbortReq,
     BatchTokenIDOut,
-    ExerciseOptions,
+    EngineOptions,
     PortArgs,
     TokenizedGenerateReq,
     get_socket,
@@ -142,9 +142,9 @@ class Scheduler:
         max_total_tokens: Optional[int],
         mem_fraction_static: float,
         context_length: int,
-        options: Optional[ExerciseOptions] = None,
+        options: Optional[EngineOptions] = None,
     ):
-        self.options = options or ExerciseOptions()
+        self.options = options or EngineOptions()
         context = zmq.Context(2)
         self.recv_from_tokenizer = get_socket(
             context, zmq.PULL, port_args.scheduler_input, bind=True
@@ -257,8 +257,7 @@ class Scheduler:
 
         Prioritizing prefill gives new requests a low time to first token, at the
         cost of a small hiccup for everyone already decoding. This is SGLang's
-        default too. (Chunked prefill, --chunked-prefill-size, splits a long
-        prompt over several steps so that the hiccup stays small.)
+        default too.
         """
         new_batch = self.get_new_batch_prefill()
         if new_batch is not None:
@@ -425,7 +424,7 @@ def run_scheduler_process(
     max_total_tokens: Optional[int],
     mem_fraction_static: float,
     context_length: int,
-    options: ExerciseOptions,
+    options: EngineOptions,
     ready_pipe,
 ):
     setup_logging("scheduler")

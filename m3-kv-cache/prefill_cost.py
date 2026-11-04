@@ -1,4 +1,4 @@
-"""Exercise 2: a burst of new requests, per-request attention against one padded call.
+"""A burst of new requests, per-request attention against one padded call.
 
     uv run m3-kv-cache/prefill_cost.py --model Qwen/Qwen3-0.6B
 
@@ -14,7 +14,7 @@ from typing import Annotated, List
 
 import typer
 
-from common import ExerciseOptions
+from common import EngineOptions
 from model_runner import FakeReq, ModelRunner
 
 MIN_TOKEN_ID, MAX_TOKEN_ID = 1000, 20000  # Ordinary tokens. Their meaning doesn't matter.
@@ -55,7 +55,7 @@ def main(
         max_running_requests=burst_size,
         max_total_tokens=(burst_size + 3) * longest,
         context_length=longest + 1,
-        options=ExerciseOptions(),
+        options=EngineOptions(),
     )
     layers = runner.model.get_decoder().layers
 

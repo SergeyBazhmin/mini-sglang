@@ -1,4 +1,4 @@
-"""Exercises 4 and 5: what do pages and lazy frees do to the allocator?
+"""What do pages and lazy frees do to the allocator?
 
     uv run m3-kv-cache/alloc_cost.py
 

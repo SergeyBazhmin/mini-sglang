@@ -14,6 +14,9 @@ Process layout (the same ring as SGLang):
               ^                                                        |
               +----------------------------PULL------------------------+
 
+Every finished request logs its tokenize time, time to first token (TTFT) and
+decode tokens/s. These are the baseline numbers for M2.
+
 Run:  uv run m1-request-lifecycle/server.py --model Qwen/Qwen3-0.6B --port 8000
 """
 
@@ -90,9 +93,17 @@ class TokenizerManager:
         max_new_tokens: int,
         temperature: float,
         top_p: float,
+        arrival: Optional[float] = None,
+        tokenize_s: float = 0.0,
     ) -> AsyncIterator[Dict[str, Any]]:
-        """Send one request to the scheduler and yield its outputs as they arrive."""
+        """Send one request to the scheduler and yield its outputs as they arrive.
+
+        arrival is when the HTTP request came in (time.perf_counter), so that
+        TTFT includes tokenizing. SGLang keeps the same timestamps in ReqState.
+        """
         rid = uuid.uuid4().hex
+        arrival = time.perf_counter() if arrival is None else arrival
+        first_at = None
         state = ReqState(event=asyncio.Event())
         self.rid_to_state[rid] = state
 
@@ -111,14 +122,18 @@ class TokenizerManager:
                 await state.event.wait()
                 state.event.clear()
                 outs, state.out_list = state.out_list, []
+                if first_at is None and outs:
+                    first_at = time.perf_counter()
                 for out in outs:
                     yield out
                 if state.finished:
+                    log_timing(rid, len(input_ids), outs[-1], arrival, tokenize_s, first_at)
                     return
         finally:
             # Runs on normal completion and also when the client disconnects
             # (Starlette cancels the response, which closes this generator).
             if not state.finished:
+                logger.info(f"Client disconnected, aborting {rid[:8]}")
                 # Not awaited: we may be inside a cancellation. zmq.asyncio sends
                 # right away when the socket is ready.
                 self.send_to_scheduler.send_pyobj(AbortReq(rid=rid))
@@ -142,6 +157,28 @@ class TokenizerManager:
                 if recv_obj.finish_reasons[i] is not None:
                     state.finished = True
                 state.event.set()
+
+
+def log_timing(
+    rid: str,
+    prompt_tokens: int,
+    last_out: Dict[str, Any],
+    arrival: float,
+    tokenize_s: float,
+    first_at: float,
+):
+    """One line per finished request. Decode speed leaves out the first token,
+    which comes from prefill."""
+    end = time.perf_counter()
+    tokens = last_out["completion_tokens"]
+    decode_s = end - first_at
+    decode_tps = (tokens - 1) / decode_s if tokens > 1 and decode_s > 0 else 0.0
+    logger.info(
+        f"Request {rid[:8]} {last_out['finish_reason']}: "
+        f"prompt={prompt_tokens} completion={tokens} "
+        f"tokenize={1000 * tokenize_s:.1f}ms TTFT={1000 * (first_at - arrival):.0f}ms "
+        f"decode={decode_tps:.1f} tok/s total={end - arrival:.2f}s"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -184,14 +221,21 @@ def build_app(tm: TokenizerManager, model_name: str) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: ChatCompletionRequest):
+        arrival = time.perf_counter()
         input_ids = tm.tokenize_chat(
             request.messages, request.chat_template_kwargs or {}
         )
+        tokenize_s = time.perf_counter() - arrival
         max_new_tokens = (
             request.max_completion_tokens or request.max_tokens or DEFAULT_MAX_TOKENS
         )
         outputs = tm.generate_request(
-            input_ids, max_new_tokens, request.temperature, request.top_p
+            input_ids,
+            max_new_tokens,
+            request.temperature,
+            request.top_p,
+            arrival=arrival,
+            tokenize_s=tokenize_s,
         )
         response_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
@@ -269,6 +313,13 @@ def main(
     ] = "Qwen/Qwen3-0.6B",
     host: Annotated[str, typer.Option(help="Address to listen on.")] = "127.0.0.1",
     port: Annotated[int, typer.Option(help="Port to listen on.")] = 8000,
+    stream_interval: Annotated[
+        int, typer.Option(help="Stream every N tokens (SGLang: --stream-interval).")
+    ] = 1,
+    naive_detokenizer: Annotated[
+        bool,
+        typer.Option(help="Decode each new token on its own, with no window. Shows why the window exists."),
+    ] = False,
 ):
     """Launch nano-serve: HTTP server + scheduler + detokenizer processes."""
     setup_logging("main")
@@ -280,11 +331,13 @@ def main(
     reader, writer = mp_ctx.Pipe(duplex=False)
     scheduler_proc = mp_ctx.Process(
         target=run_scheduler_process,
-        args=(model, port_args, writer),
+        args=(model, port_args, stream_interval, writer),
         daemon=True,
     )
     detokenizer_proc = mp_ctx.Process(
-        target=run_detokenizer_process, args=(model, port_args), daemon=True
+        target=run_detokenizer_process,
+        args=(model, port_args, naive_detokenizer),
+        daemon=True,
     )
     scheduler_proc.start()
     detokenizer_proc.start()

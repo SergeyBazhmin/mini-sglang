@@ -1,6 +1,6 @@
 """Check retraction, page accounting and double frees. No model and no GPU needed.
 
-    uv run m3-kv-cache/test/test_scheduler.py
+    uv run pytest m3-kv-cache/tests/test_scheduler.py
 
 A fake ModelRunner returns a fixed token but keeps the real slot bookkeeping
 (_prepare_extend, _prepare_decode, free_req), so these tests pin down which
@@ -8,15 +8,11 @@ requests run and where their slots go. test_batching.py checks that a retracted
 request still produces the right tokens.
 """
 
-import sys
-from pathlib import Path
 from typing import List, Optional
 
-# Run as a script from test/, so make the chapter's modules importable.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
+import pytest
 import scheduler as scheduler_module
-from common import ExerciseOptions, PortArgs, TokenizedGenerateReq
+from common import EngineOptions, PortArgs, TokenizedGenerateReq
 from memory_pool import ReqToTokenPool, TokenAllocator
 from model_runner import ModelRunner
 from scheduler import ForwardMode, Req, Scheduler
@@ -35,7 +31,7 @@ class FakeRunner(ModelRunner):
         max_total_tokens: int,
         mem_fraction_static: float,
         context_length: int,
-        options: ExerciseOptions,
+        options: EngineOptions,
     ):
         self.device = "cpu"
         self.eos_ids = {0}
@@ -71,7 +67,7 @@ class Sink:
 def make_scheduler(pool: int, context_length: int = 8192, **options) -> Scheduler:
     scheduler_module.ModelRunner = FakeRunner
     s = Scheduler(
-        "fake", PortArgs.new(), 8, 8192, pool, 0.6, context_length, ExerciseOptions(**options)
+        "fake", PortArgs.new(), 8, 8192, pool, 0.6, context_length, EngineOptions(**options)
     )
     s.send_to_detokenizer = Sink()
     return s
@@ -297,22 +293,6 @@ def test_free_req_twice_raises():
     step(s)
     available = s.model_runner.allocator.available_size()
     s.model_runner.free_req(a)
-    try:
+    with pytest.raises(RuntimeError, match="double free"):
         s.model_runner.free_req(a)
-    except RuntimeError as error:
-        assert "double free" in str(error)
-    else:
-        raise AssertionError("expected the second free_req to raise")
     assert s.model_runner.allocator.available_size() == available + 4
-
-
-def main():
-    tests = [v for k, v in globals().items() if k.startswith("test_")]
-    for test in tests:
-        test()
-        print(f"PASS  {test.__name__}")
-    print(f"\n{len(tests)} tests passed.")
-
-
-if __name__ == "__main__":
-    main()

@@ -42,7 +42,7 @@ from transformers import AutoTokenizer
 from common import (
     AbortReq,
     BatchStrOut,
-    ExerciseOptions,
+    EngineOptions,
     PortArgs,
     TokenizedGenerateReq,
     get_socket,
@@ -318,23 +318,23 @@ def main(
         int, typer.Option(help="Longest request, prompt + output, in tokens (SGLang: --context-length).")
     ] = 8192,
     new_token_ratio: Annotated[
-        float, typer.Option(help="Ex 1: share of new tokens to reserve, 1 never retracts.")
+        float, typer.Option(help="Share of new tokens to reserve, 1 never retracts.")
     ] = 1.0,
     batched_prefill: Annotated[
-        bool, typer.Option(help="Ex 2: one padded attention call per prefill batch.")
+        bool, typer.Option(help="One padded attention call per prefill batch.")
     ] = False,
-    page_size: Annotated[int, typer.Option(help="Ex 4: slots handed out at a time.")] = 1,
+    page_size: Annotated[int, typer.Option(help="Slots handed out at a time.")] = 1,
     lazy_free: Annotated[
-        bool, typer.Option(help="Ex 5: merge the free list only when alloc runs short.")
+        bool, typer.Option(help="Merge the free list only when alloc runs short.")
     ] = False,
     check_double_free: Annotated[
-        bool, typer.Option(help="Ex 6: track free pages and raise on a double free.")
+        bool, typer.Option(help="Track free pages and raise on a double free.")
     ] = False,
 ):
     """Launch nano-serve: HTTP server + scheduler + detokenizer processes."""
     if not 0 < new_token_ratio <= 1:
         raise typer.BadParameter("--new-token-ratio must be in (0, 1].")
-    options = ExerciseOptions(
+    options = EngineOptions(
         new_token_ratio=new_token_ratio,
         batched_prefill=batched_prefill,
         page_size=page_size,

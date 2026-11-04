@@ -18,3 +18,15 @@ dependencies = [
 [tool.uv]
 # Plain scripts, not an installable package.
 package = false
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["m4-radix-cache/tests"]
+# Every chapter has the same test file names, so they can't be top-level modules.
+# Tests that use a model only run when asked for, with -m model.
+addopts = '--import-mode=importlib -m "not model"'
+markers = ["model: builds or loads a model, even a tiny random one"]

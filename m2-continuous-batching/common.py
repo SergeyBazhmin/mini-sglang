@@ -62,6 +62,14 @@ def get_socket(context: zmq.Context, socket_type: int, addr: str, bind: bool):
     return sock
 
 
+@dataclasses.dataclass
+class SchedulerOptions:
+    """Scheduling switches. The defaults give plain continuous batching."""
+
+    decode_first: bool = False  # Static batching, for comparison.
+    stream_interval: int = 1  # Send output every N tokens.
+
+
 # ---------------------------------------------------------------------------
 # Messages. They are pickled with send_pyobj / recv_pyobj.
 # ---------------------------------------------------------------------------

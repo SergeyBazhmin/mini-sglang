@@ -11,9 +11,9 @@ Three processes, connected in a ring by ZMQ, the same way SGLang does it:
 
 | file | role | SGLang counterpart |
 |---|---|---|
-| `server.py` | HTTP, chat template, tokenize, one `ReqState` + `asyncio.Event` per request, a single `handle_loop` | `entrypoints/http_server.py`, `entrypoints/openai/serving_chat.py`, `managers/tokenizer_manager.py` |
-| `scheduler.py` | loop: ingest → pick → forward → stream; prefill then decode; sampling; abort | `managers/scheduler.py`, `managers/schedule_batch.py` (`Req`), `scheduler_components/output_streamer.py` |
-| `detokenizer.py` | incremental decoding with `surr_offset`/`read_offset` windows | `managers/detokenizer_manager.py` |
+| `server.py` | HTTP, chat template, tokenize, one `ReqState` + `asyncio.Event` per request, a single `handle_loop`, per-request timing | `entrypoints/http_server.py`, `entrypoints/openai/serving_chat.py`, `managers/tokenizer_manager.py` |
+| `scheduler.py` | loop: ingest → pick → forward → stream; prefill then decode; sampling; abort; `stream_interval` | `managers/scheduler.py`, `managers/schedule_batch.py` (`Req`), `scheduler_components/output_streamer.py` |
+| `detokenizer.py` | incremental decoding with `surr_offset`/`read_offset` windows, printable prefix | `managers/detokenizer_manager.py` |
 | `common.py` | message dataclasses, socket helper | `managers/io_struct.py`, `utils.get_zmq_socket` |
 
 What v0 does **not** do yet:
@@ -39,9 +39,28 @@ It also runs on CPU, slowly (float32).
 2. The non-ASCII test prints `PASS`.
 3. Both concurrent requests finish, and the timings show the second one waiting for the first.
 
-## Exercises (modify the code)
-1. **Prove the detokenizer matters.** In `detokenizer.py`, replace the window logic with `self._decode(new_ids)`. Run test 2 again and watch for `�` and broken spacing.
-2. **Abort.** Start a long streaming request, then press Ctrl-C in the client. Add a log line in `Scheduler.abort_request` to confirm it's called. Which process noticed the disconnect first?
-3. **`stream_interval`.** Make the scheduler send output only every N tokens, or when the request finishes. Measure the effect on the number of ZMQ messages, and on how smooth the stream looks.
-4. **Printable prefix.** When `new_text` ends in `�`, SGLang still emits the clean part before it. Implement this; read `detokenizer_manager.py` lines ~395–420 first.
-5. **Timing.** Log tokenize time, time to the first token, and decode tokens/s per request. Keep these numbers: they're the baseline for M2.
+## Details worth a closer look
+
+1. **The detokenizer window matters.** Start the server with `--naive-detokenizer`,
+   which decodes only the new ids each time, and run `client.py` again. Check 2 now
+   fails: characters split across tokens come out as `�`, and spacing can break.
+2. **Abort.** Start a long streaming request, then press Ctrl-C in the client. The
+   main process notices first: Starlette cancels the response, so
+   `TokenizerManager.generate_request` logs `Client disconnected` and sends `AbortReq`.
+   Then the scheduler logs `Abort ...: stopped after N tokens` from `abort_request`.
+3. **`stream_interval`.** `--stream-interval N` sends a request's output only every N
+   tokens. The first token still goes out at once so that TTFT doesn't suffer, and a
+   finished request always flushes. The scheduler logs `N tokens in M messages` for
+   every finished request, so compare M at 1, 4 and 16. The stream gets choppier as
+   N grows, since text arrives in bursts of N tokens.
+4. **Printable prefix.** When the window's new text ends in `�`, the clean part before
+   it still goes out, cut back to the last space, newline or CJK character so that it
+   can't change later (SGLang: `find_printable_text`, `detokenizer_manager.py`
+   ~395–420). The rest waits for the next token.
+5. **Timing.** Every finished request logs its tokenize time, time to first token and
+   decode tokens/s. Keep these numbers: they're the baseline for M2.
+
+```bash
+uv run m1-request-lifecycle/server.py --model Qwen/Qwen3-0.6B --port 8000 --stream-interval 4
+uv run m1-request-lifecycle/server.py --model Qwen/Qwen3-0.6B --port 8000 --naive-detokenizer
+```

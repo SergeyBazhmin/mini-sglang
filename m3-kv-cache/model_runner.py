@@ -28,7 +28,7 @@ import torch
 from transformers import AutoModelForCausalLM
 
 from attention import ForwardBatch, GatherTimer, PoolAttention
-from common import ExerciseOptions
+from common import EngineOptions
 from memory_pool import ReqToTokenPool, TokenAllocator, TokenToKVPool
 
 # Arbitrary. There's no free-memory query on CPU, so pick something small.
@@ -91,9 +91,9 @@ class ModelRunner:
         mem_fraction_static: float = 0.6,
         context_length: int = 8192,
         device: Optional[str] = None,
-        options: Optional[ExerciseOptions] = None,
+        options: Optional[EngineOptions] = None,
     ):
-        options = options or ExerciseOptions()
+        options = options or EngineOptions()
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         dtype = torch.bfloat16 if self.device == "cuda" else torch.float32
         self.model = (
@@ -171,7 +171,7 @@ class ModelRunner:
     def _prepare_extend(self, reqs: List[ReqLike]) -> ForwardBatch:
         """Take a table row and one slot per token, for every request.
 
-        A retracted request (exercise 1) prefills its output too, the newest
+        A retracted request prefills its output too, the newest
         token included, so its state after this step is what a decode step
         would have left.
         """
@@ -263,7 +263,7 @@ class ModelRunner:
         """Give the request's slots and table row back. No K/V is touched."""
         row = req.req_pool_idx
         if row is None:
-            # Exercise 6. See the README for what this stops.
+            # See the README (Double free) for what this stops.
             raise RuntimeError("free_req on a request that holds no KV: double free?")
         table = self.req_to_token_pool.req_to_token
         self.allocator.free(table[row, : req.kv_allocated_len])

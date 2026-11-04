@@ -10,6 +10,10 @@ Why not just decode each new token on its own?
      across several tokens. Decoding half of it gives "�".
   2. Some tokenizers decide spacing from neighbouring tokens.
 So we decode a window, ids[surr:read] and ids[surr:], and emit the difference.
+
+While a character is incomplete, the clean text before it still goes out, the way
+SGLang emits the printable prefix. naive=True (M1's --naive-detokenizer) turns all
+of this off and decodes each batch of new ids on its own, to show what goes wrong.
 """
 
 import dataclasses
@@ -29,10 +33,13 @@ class DecodeStatus:
     # only as context so the next token decodes the same way it would in a full decode.
     surr_offset: int
     read_offset: int
+    # How much of the text after read_offset was already emitted as a printable
+    # prefix, while the window waited for the rest of a character.
+    sent_len: int = 0
 
 
 class Detokenizer:
-    def __init__(self, model_path: str, port_args: PortArgs):
+    def __init__(self, model_path: str, port_args: PortArgs, naive: bool = False):
         context = zmq.Context(2)
         self.recv_from_scheduler = get_socket(
             context, zmq.PULL, port_args.detokenizer_input, bind=True
@@ -42,6 +49,7 @@ class Detokenizer:
         )
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.decode_status: Dict[str, DecodeStatus] = {}
+        self.naive = naive
 
     def event_loop(self):
         while True:
@@ -52,6 +60,8 @@ class Detokenizer:
         return self.tokenizer.decode(ids, skip_special_tokens=True)
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOut) -> BatchStrOut:
+        if self.naive:
+            return self._handle_naive(recv_obj)
         text_deltas = []
         for rid, new_ids, prompt_tail, finish_reason in zip(
             recv_obj.rids,
@@ -74,18 +84,21 @@ class Detokenizer:
 
             if finish_reason is not None:
                 # Last message: flush whatever is left and free the state.
-                text_deltas.append(new_text)
+                text_deltas.append(new_text[s.sent_len :])
                 del self.decode_status[rid]
             elif new_text and not new_text.endswith("�"):
                 # Clean text: emit it and slide the window forward.
-                text_deltas.append(new_text)
+                text_deltas.append(new_text[s.sent_len :])
                 s.surr_offset = s.read_offset
                 s.read_offset = len(s.decode_ids)
+                s.sent_len = 0
             else:
-                # Incomplete UTF-8 character: emit nothing and keep the offsets,
-                # so the next call retries with more tokens. (SGLang also emits
-                # the printable prefix here. Try adding that yourself.)
-                text_deltas.append("")
+                # Incomplete UTF-8 character: keep the offsets, so the next call
+                # retries with more tokens, but emit the clean text before it.
+                # SGLang: find_printable_text in _decode_batch_token_id_output.
+                printable = printable_prefix(new_text)
+                text_deltas.append(printable[s.sent_len :])
+                s.sent_len = max(s.sent_len, len(printable))
 
         return BatchStrOut(
             rids=recv_obj.rids,
@@ -94,9 +107,32 @@ class Detokenizer:
             completion_tokens=recv_obj.completion_tokens,
         )
 
+    def _handle_naive(self, recv_obj: BatchTokenIDOut) -> BatchStrOut:
+        """Decode only the new ids, with no window. Split characters come out as
+        "�", and tokenizers that drop a leading space lose spacing too."""
+        return BatchStrOut(
+            rids=recv_obj.rids,
+            text_deltas=[self._decode(ids) for ids in recv_obj.new_token_ids],
+            finish_reasons=recv_obj.finish_reasons,
+            completion_tokens=recv_obj.completion_tokens,
+        )
 
-def run_detokenizer_process(model_path: str, port_args: PortArgs):
+
+def printable_prefix(text: str) -> str:
+    """The part of text before its first "�", cut back to the last space.
+
+    Cutting at a space keeps the prefix stable: a tokenizer may still change how
+    the end of a word decodes once more tokens arrive. CJK text has no spaces, so
+    a newline or a CJK character ends a safe prefix too. (SGLang: find_printable_text.)
+    """
+    clean = text.split("�", 1)[0]
+    if clean.endswith("\n") or (clean and ord(clean[-1]) >= 0x3000):
+        return clean
+    return clean[: clean.rfind(" ") + 1]
+
+
+def run_detokenizer_process(model_path: str, port_args: PortArgs, naive: bool = False):
     setup_logging("detokenizer")
-    detokenizer = Detokenizer(model_path, port_args)
-    logger.info("Ready")
+    detokenizer = Detokenizer(model_path, port_args, naive)
+    logger.info("Ready" + (" (naive: no decoding window)" if naive else ""))
     detokenizer.event_loop()

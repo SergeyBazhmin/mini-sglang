@@ -1,23 +1,21 @@
-"""Exercise 2: the padded prefill must compute what the per-request loop computes.
+"""The padded prefill (--batched-prefill) must compute what the per-request loop computes.
 
-    uv run m3-kv-cache/test/test_attention.py
+    uv run pytest m3-kv-cache/tests/test_attention.py -m model
 
 No weights to download and no GPU needed: a tiny randomly initialized attention
 layer over random K/V is enough, because the two paths only differ in how they
 line tokens up. test_batching.py --batched-prefill checks a real model.
 """
 
-import sys
-from pathlib import Path
 
+import pytest
 import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention
 
-# Run as a script from test/, so make the chapter's modules importable.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from attention import ForwardBatch, PoolAttention
+
+pytestmark = pytest.mark.model
 
 NUM_HEADS = 4
 NUM_KV_HEADS = 2  # Fewer than the query heads, as in Qwen3.
@@ -78,15 +76,3 @@ def test_stale_table_entries_are_masked():
     attention.v_buffer[0] = 100.0
     got = attention._run_extend_batched(q, fb)
     assert torch.allclose(got[:2], want[:2], atol=1e-4)
-
-
-def main():
-    tests = [v for k, v in globals().items() if k.startswith("test_")]
-    for test in tests:
-        test()
-        print(f"PASS  {test.__name__}")
-    print(f"\n{len(tests)} tests passed.")
-
-
-if __name__ == "__main__":
-    main()

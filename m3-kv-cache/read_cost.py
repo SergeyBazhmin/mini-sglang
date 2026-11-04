@@ -1,4 +1,4 @@
-"""Exercise 3: how much of a decode step is copying K/V out of the pool?
+"""How much of a decode step is copying K/V out of the pool?
 
     uv run m3-kv-cache/read_cost.py --model Qwen/Qwen3-0.6B
 
@@ -18,7 +18,7 @@ from typing import Annotated, List
 
 import typer
 
-from common import ExerciseOptions
+from common import EngineOptions
 from model_runner import FakeReq, ModelRunner
 
 MIN_TOKEN_ID, MAX_TOKEN_ID = 1000, 20000  # Ordinary tokens. Their meaning doesn't matter.
@@ -37,7 +37,7 @@ def main(
         max_running_requests=batch_size,
         max_total_tokens=batch_size * longest,
         context_length=longest,
-        options=ExerciseOptions(profile_gather=True),
+        options=EngineOptions(profile_gather=True),
     )
 
     print(f"device={runner.device} batch_size={batch_size}")

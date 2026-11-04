@@ -23,7 +23,7 @@ which slots belong together.
 SGLang's real allocator is usually the paged one (allocator/paged.py): it hands
 out pages of 64 slots, so a request's tokens are mostly contiguous, which the
 GPU attention kernels need. By default ours is page_size=1, the case of SGLang's
-TokenToKVPoolAllocator. --page-size turns on the paged behaviour (exercise 4).
+TokenToKVPoolAllocator. --page-size turns on the paged behaviour.
 """
 
 from typing import List, Optional
@@ -60,11 +60,11 @@ class TokenAllocator:
         )
         self.page_offsets = torch.arange(page_size, device=device)
 
-        # Exercise 5: frees wait here, and join free_pages when alloc runs short.
+        # --lazy-free: frees wait here, and join free_pages when alloc runs short.
         self.released: List[torch.Tensor] = []
         self.num_released = 0
 
-        # Exercise 6: which pages are free. Slot 0 counts as free, so that
+        # --check-double-free: which pages are free. Slot 0 counts as free, so that
         # freeing it is caught as well.
         self.is_free: Optional[torch.Tensor] = None
         if check_double_free:
@@ -106,7 +106,9 @@ class TokenAllocator:
         if self.is_free is not None:
             self._mark_free(pages)
         if self.lazy_free:
-            self.released.append(pages)
+            # A copy: callers pass a slice of the table, which is a view. Kept as
+            # is, the next owner of the row would rewrite this list.
+            self.released.append(pages.clone())
             self.num_released += len(pages)
         else:
             self.free_pages = torch.cat((self.free_pages, pages))

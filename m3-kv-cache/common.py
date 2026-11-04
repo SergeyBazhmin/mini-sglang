@@ -28,21 +28,21 @@ def setup_logging(proc_name: str):
     )
 
 # ---------------------------------------------------------------------------
-# Exercise switches
+# Engine switches
 # ---------------------------------------------------------------------------
 
 
 @dataclasses.dataclass
-class ExerciseOptions:
-    """The README exercises, one switch each. The defaults reserve memory the
-    chapter's way and leave every exercise off."""
+class EngineOptions:
+    """Engine switches, one per feature. The defaults reserve memory in full and
+    leave every optional feature off."""
 
-    new_token_ratio: float = 1.0  # Ex 1. Share of new tokens to reserve.
-    batched_prefill: bool = False  # Ex 2. Padded attention instead of a loop.
-    profile_gather: bool = False  # Ex 3. Used by read_cost.py, not the server.
-    page_size: int = 1  # Ex 4. Slots handed out at a time.
-    lazy_free: bool = False  # Ex 5. Merge the free list only when it runs short.
-    check_double_free: bool = False  # Ex 6. Costs one lookup per free.
+    new_token_ratio: float = 1.0  # Share of new tokens to reserve.
+    batched_prefill: bool = False  # Padded attention instead of a loop.
+    profile_gather: bool = False  # Used by read_cost.py, not the server.
+    page_size: int = 1  # Slots handed out at a time.
+    lazy_free: bool = False  # Merge the free list only when it runs short.
+    check_double_free: bool = False  # Costs one lookup per free.
 
 
 # ---------------------------------------------------------------------------

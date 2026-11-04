@@ -9,16 +9,21 @@ SGLang equivalents:
   - LogitsProcessor              layers/logits_processor.py
 
 The scheduler decides WHICH requests run; this class only knows HOW to run them.
-Keeping the two apart is what lets test_batching.py check the batched forward
+Keeping the two apart is what lets tests/test_batching.py check the batched forward
 against HF directly, without any processes or sockets.
 
 The KV cache still lives inside each request, as one tensor. To run a batch we
 pad all requests' caches to the same length, and after the step we copy the
 new K/V back out. That copying grows with the total context length and is
 exactly the waste the token pool in M3 removes.
+
+Also here:
+  - DecodeTimer splits forward_decode into copying and the model call.
 """
 
-from typing import List, Optional, Protocol, Set
+import dataclasses
+import time
+from typing import Dict, List, Optional, Protocol, Set
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
@@ -34,6 +39,17 @@ class ReqLike(Protocol):
     top_p: float
     # [num_tokens, num_layers, 2 (k/v), num_kv_heads, head_dim], or None before prefill.
     kv: torch.Tensor
+
+
+@dataclasses.dataclass
+class FakeReq:
+    """A ReqLike with no scheduler behind it, for scripts that drive ModelRunner directly."""
+
+    input_ids: List[int]
+    output_ids: List[int] = dataclasses.field(default_factory=list)
+    temperature: float = 0.0
+    top_p: float = 1.0
+    kv: Optional[torch.Tensor] = None
 
 
 def sample(
@@ -59,9 +75,56 @@ def sample(
     return torch.where(temperatures <= 0, greedy, sampled).tolist()
 
 
+class DecodeTimer:
+    """Where forward_decode's time goes. Does nothing unless enabled."""
+
+    def __init__(self, device: str, enabled: bool):
+        self.device = device
+        self.enabled = enabled
+        self.reset()
+
+    def reset(self):
+        self.seconds = {"pad": 0.0, "model": 0.0, "cat": 0.0}
+        self.steps = 0
+        self.context_sum = 0.0
+
+    def _now(self) -> float:
+        # GPU work is asynchronous. Without this, the time of a phase would
+        # land on whichever later phase happens to wait for the GPU.
+        if self.device == "cuda":
+            torch.cuda.synchronize()
+        return time.perf_counter()
+
+    def start(self, lens: torch.Tensor):
+        if self.enabled:
+            self.steps += 1
+            self.context_sum += lens.float().mean().item()
+            self.last = self._now()
+
+    def mark(self, phase: str):
+        if self.enabled:
+            now = self._now()
+            self.seconds[phase] += now - self.last
+            self.last = now
+
+    def report(self) -> Dict[str, float]:
+        """Average milliseconds per step since the last report, and start over."""
+        steps = max(self.steps, 1)
+        out = {phase: 1000 * s / steps for phase, s in self.seconds.items()}
+        out["mean_context"] = self.context_sum / steps
+        self.reset()
+        return out
+
+
 class ModelRunner:
-    def __init__(self, model_path: str, device: Optional[str] = None):
+    def __init__(
+        self,
+        model_path: str,
+        device: Optional[str] = None,
+        profile_decode: bool = False,
+    ):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.decode_timer = DecodeTimer(self.device, profile_decode)
         dtype = torch.bfloat16 if self.device == "cuda" else torch.float32
         self.model = (
             AutoModelForCausalLM.from_pretrained(model_path, dtype=dtype)
@@ -135,19 +198,13 @@ class ModelRunner:
         new K/V of every request lands at the same index, -1.
         """
         lens = torch.tensor([r.kv.shape[0] for r in reqs], device=self.device)
+        self.decode_timer.start(lens)
         # [batch, max_len, layers, 2, heads, dim], zeros where padded.
         kv = pad_sequence([r.kv for r in reqs], batch_first=True, padding_side="left")
         max_len = kv.shape[1]
-        cache = DynamicCache(
-            ddp_cache_data=[
-                (
-                    kv[:, :, layer, 0].transpose(1, 2).contiguous(),  # [batch, heads, len, dim]
-                    kv[:, :, layer, 1].transpose(1, 2).contiguous(),
-                )
-                for layer in range(self.num_layers)
-            ]
-        )
+        cache = self._to_cache(kv)
         del kv
+        self.decode_timer.mark("pad")
 
         input_ids = torch.tensor([[r.output_ids[-1]] for r in reqs], device=self.device)
         # Mask covers the cache plus the new token: 0 on the padding, 1 elsewhere.
@@ -163,13 +220,27 @@ class ModelRunner:
             use_cache=True,
             logits_to_keep=1,
         ).logits[:, -1]
+        self.decode_timer.mark("model")
 
         # Append the new token's K/V to each request. torch.cat copies the
         # whole cache of every request, every step. M3 fixes this.
         new_kv = self._stack_cache(cache, last_only=True)  # [batch, 1, layers, 2, heads, dim]
         for i, req in enumerate(reqs):
             req.kv = torch.cat([req.kv, new_kv[i]])
+        self.decode_timer.mark("cat")
         return logits
+
+    def _to_cache(self, kv: torch.Tensor) -> DynamicCache:
+        """[batch, len, layers, 2, heads, dim] -> HF cache."""
+        return DynamicCache(
+            ddp_cache_data=[
+                (
+                    kv[:, :, layer, 0].transpose(1, 2).contiguous(),  # [batch, heads, len, dim]
+                    kv[:, :, layer, 1].transpose(1, 2).contiguous(),
+                )
+                for layer in range(self.num_layers)
+            ]
+        )
 
     def _stack_cache(self, cache: DynamicCache, last_only: bool = False) -> torch.Tensor:
         """HF cache -> one [batch, seq, layers, 2, heads, dim] tensor."""

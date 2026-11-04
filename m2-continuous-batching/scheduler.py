@@ -10,6 +10,7 @@ SGLang equivalent: python/sglang/srt/managers/scheduler.py
     scheduler_components/batch_result_processor.py (process_batch_result_prefill/_decode)
   - ScheduleBatch, Req                managers/schedule_batch.py
   - ForwardMode                       model_executor/forward_batch_info.py (~line 199)
+  - OutputStreamer                    scheduler_components/output_streamer.py (~line 462)
 
 The forward pass itself lives in model_runner.py.
 
@@ -19,6 +20,10 @@ v1 does CONTINUOUS BATCHING. Each loop iteration runs ONE forward pass, either:
 New requests join the running batch right after their prefill, and finished
 requests leave it right after the step that finished them. Nobody waits for
 the whole batch to drain, which is the difference from "static" batching.
+
+Options, all off by default (see SchedulerOptions in common.py):
+  - decode_first: get_next_batch_to_run.
+  - stream_interval: stream_output.
 """
 
 import collections
@@ -34,6 +39,7 @@ from loguru import logger
 from common import (
     AbortReq,
     BatchTokenIDOut,
+    SchedulerOptions,
     PortArgs,
     TokenizedGenerateReq,
     get_socket,
@@ -107,6 +113,7 @@ class Scheduler:
         port_args: PortArgs,
         max_running_requests: int,
         max_prefill_tokens: int,
+        options: SchedulerOptions,
     ):
         context = zmq.Context(2)
         self.recv_from_tokenizer = get_socket(
@@ -126,6 +133,7 @@ class Scheduler:
         # that keeps us from running out of memory. M3 adds a real token budget.
         self.max_running_requests = max_running_requests
         self.max_prefill_tokens = max_prefill_tokens
+        self.options = options
 
         self.waiting_queue: Deque[Req] = collections.deque()
         # Requests that finished prefill and are now decoding.
@@ -191,9 +199,14 @@ class Scheduler:
 
         Prioritizing prefill gives new requests a low time to first token, at the
         cost of a small hiccup for everyone already decoding. This is SGLang's
-        default too. (Chunked prefill, --chunked-prefill-size, splits a long
-        prompt over several steps so that the hiccup stays small.)
+        default too.
+
+        With decode_first, new requests wait until the running batch
+        has fully drained. That is static batching.
         """
+        if self.options.decode_first and self.running_batch:
+            return ScheduleBatch(self.running_batch, ForwardMode.DECODE)
+
         new_batch = self.get_new_batch_prefill()
         if new_batch is not None:
             return new_batch
@@ -260,17 +273,23 @@ class Scheduler:
     def stream_output(self, reqs: List[Req]):
         """Send the new token ids of all these requests in ONE message.
 
-        SGLang: OutputStreamer.stream_output. It can also send only every
-        `stream_interval` tokens.
+        SGLang: OutputStreamer.stream_output.
+
+        With stream_interval, a running request is sent only once `stream_interval` tokens
+        are unsent. Its first token still goes out at once, or TTFT would pay
+        for the interval, and a finished request always flushes.
         """
         out = BatchTokenIDOut(
             rids=[], new_token_ids=[], prompt_tails=[], finish_reasons=[], completion_tokens=[]
         )
         for req in reqs:
             new_ids = req.output_ids[req.num_sent :]
-            if not new_ids and req.finish_reason is None:
-                continue
             is_first = req.num_sent == 0
+            if req.finish_reason is None and (
+                not new_ids
+                or (not is_first and len(new_ids) < self.options.stream_interval)
+            ):
+                continue
             req.num_sent = len(req.output_ids)
 
             out.rids.append(req.rid)
@@ -302,12 +321,13 @@ def run_scheduler_process(
     port_args: PortArgs,
     max_running_requests: int,
     max_prefill_tokens: int,
+    options: SchedulerOptions,
     ready_pipe,
 ):
     setup_logging("scheduler")
     try:
         scheduler = Scheduler(
-            model_path, port_args, max_running_requests, max_prefill_tokens
+            model_path, port_args, max_running_requests, max_prefill_tokens, options
         )
     except Exception:
         ready_pipe.send(traceback.format_exc())

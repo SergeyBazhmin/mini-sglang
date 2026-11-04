@@ -1,7 +1,7 @@
 """Check that batching does not change the output: greedy tokens from the
 batched ModelRunner must match HF `generate` run on each prompt alone.
 
-    uv run m2-continuous-batching/test_batching.py --model Qwen/Qwen3-0.6B
+    uv run pytest m2-continuous-batching/tests/test_batching.py -m model --model Qwen/Qwen3-0.6B
 
 Requests have different prompt lengths and join the batch at different steps,
 so this covers right padding in prefill, left padding in decode, and merging
@@ -14,14 +14,15 @@ not a bug in the batching, and the "first mismatch" position shows how far
 they agreed. (SGLang has a whole mode for this, --enable-deterministic-inference.)
 """
 
-import dataclasses
-from typing import Annotated, List, Optional
+from typing import List
 
+import pytest
 import torch
-import typer
 from transformers import AutoTokenizer
 
-from model_runner import ModelRunner
+from model_runner import FakeReq, ModelRunner
+
+pytestmark = pytest.mark.model
 
 PROMPTS = [
     "The capital of France is",
@@ -33,15 +34,6 @@ PROMPTS = [
 # Step at which each prompt joins the batch. Several share a step, the rest
 # arrive while the others are already decoding.
 JOIN_AT_STEP = [0, 0, 3, 7, 7]
-
-
-@dataclasses.dataclass
-class FakeReq:
-    input_ids: List[int]
-    output_ids: List[int] = dataclasses.field(default_factory=list)
-    temperature: float = 0.0
-    top_p: float = 1.0
-    kv: Optional[torch.Tensor] = None
 
 
 def run_batched(runner: ModelRunner, prompts_ids: List[List[int]], max_new_tokens: int):
@@ -75,10 +67,7 @@ def run_reference(runner: ModelRunner, prompt_ids: List[int], max_new_tokens: in
     return out[0, len(prompt_ids) :].tolist()
 
 
-def main(
-    model: Annotated[str, typer.Option(help="HF model id or local path.")] = "Qwen/Qwen3-0.6B",
-    max_new_tokens: Annotated[int, typer.Option(help="Tokens to generate per prompt.")] = 32,
-):
+def test_matches_hf(model: str, max_new_tokens: int):
     """Compare batched greedy decoding with HF generate, prompt by prompt."""
     runner = ModelRunner(model)
     tokenizer = AutoTokenizer.from_pretrained(model)
@@ -98,9 +87,5 @@ def main(
             print(f"  batched: {tokenizer.decode(got)!r}")
             print(f"  HF:      {tokenizer.decode(want)!r}")
     print(f"\n{num_exact}/{len(PROMPTS)} prompts match token-for-token.")
-    if runner.device == "cpu" and num_exact != len(PROMPTS):
-        raise SystemExit("FAIL: on CPU (float32) all prompts should match.")
-
-
-if __name__ == "__main__":
-    typer.run(main)
+    if runner.device == "cpu":
+        assert num_exact == len(PROMPTS), "on CPU (float32) all prompts should match"

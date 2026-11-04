@@ -1,15 +1,11 @@
 """Unit checks for the allocator and the table. No model, no GPU, takes a second.
 
-    uv run m3-kv-cache/test/test_memory_pool.py
+    uv run pytest m3-kv-cache/tests/test_memory_pool.py
 """
 
-import sys
-from pathlib import Path
 
+import pytest
 import torch
-
-# Run as a script from test/, so make the chapter's modules importable.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from memory_pool import ReqToTokenPool, TokenAllocator, TokenToKVPool
 
@@ -22,6 +18,16 @@ def test_alloc_and_free():
 
     allocator.free(first[[1, 3]])  # Slots 2 and 4: holes in the middle.
     assert allocator.available_size() == 5
+
+
+def test_lazy_free_keeps_the_slots_after_their_row_is_reused():
+    allocator = TokenAllocator(size=8, device="cpu", lazy_free=True)
+    table = torch.zeros(1, 8, dtype=torch.int64)
+    table[0, :4] = allocator.alloc(4)
+    allocator.free(table[0, :4])  # A view of the table, as in free_req.
+    table[0, :4] = allocator.alloc(4)
+    allocator.merge_released()
+    assert sorted(allocator.free_pages.tolist()) == [1, 2, 3, 4]
 
 
 def test_alloc_failure_takes_nothing():
@@ -96,11 +102,8 @@ def test_freeing_a_table_row_returns_whole_pages():
 
 
 def test_pool_size_must_be_whole_pages():
-    try:
+    with pytest.raises(ValueError):
         TokenAllocator(size=10, device="cpu", page_size=4)
-    except ValueError:
-        return
-    raise AssertionError("expected a ValueError")
 
 
 def test_lazy_free_counts_released_slots_and_merges_when_short():
@@ -127,12 +130,8 @@ def test_lazy_free_keeps_the_free_list_whole():
 
 
 def expect_double_free(allocator: TokenAllocator, slots: torch.Tensor):
-    try:
+    with pytest.raises(RuntimeError, match="Double free"):
         allocator.free(slots)
-    except RuntimeError as error:
-        assert "Double free" in str(error)
-        return
-    raise AssertionError("expected the double free to be caught")
 
 
 def test_double_free_is_caught_at_the_first_repeat():
@@ -173,7 +172,3 @@ def main():
         test()
         print(f"PASS  {test.__name__}")
     print(f"\n{len(tests)} tests passed.")
-
-
-if __name__ == "__main__":
-    main()

@@ -1,7 +1,7 @@
 """Check that the KV pool does not change the output: greedy tokens from the
 batched ModelRunner must match HF `generate` run on each prompt alone.
 
-    uv run m3-kv-cache/test/test_batching.py --model Qwen/Qwen3-0.6B
+    uv run pytest m3-kv-cache/tests/test_batching.py -m model --model Qwen/Qwen3-0.6B
 
 Requests have different prompt lengths, join the batch at different steps and
 finish at different steps, so a request's slots end up scattered through the
@@ -9,11 +9,10 @@ pool. The pool is only slightly bigger than one pass needs, so the second pass
 runs almost entirely on recycled slots. After each pass every slot must be back
 on the free list, and GPU memory must not have grown.
 
-One request is retracted partway (exercise 1): its slots are freed and it prefills
-its prompt and output again, which must not change a single token. The flags turn
-on the exercises that change how a batch runs, and the output must not change:
-
-    uv run m3-kv-cache/test/test_batching.py --batched-prefill --page-size 64 --lazy-free
+One request is retracted partway: its slots are freed and it prefills
+its prompt and output again, which must not change a single token. Other runs turn
+on the options that change how a batch runs, and the output must not change.
+The test runs both ways.
 
 On CPU (float32) every token should match. On GPU (bfloat16) a request's result
 can depend slightly on the other requests in its batch, so a near-tie between
@@ -22,19 +21,16 @@ in the pool, and the "first mismatch" position shows how far they agreed.
 (SGLang has a whole mode for this, --enable-deterministic-inference.)
 """
 
-import sys
-from pathlib import Path
-from typing import Annotated, List
+from typing import List
 
+import pytest
 import torch
-import typer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Run as a script from test/, so make the chapter's modules importable.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from common import ExerciseOptions
+from common import EngineOptions
 from model_runner import FakeReq, ModelRunner
+
+pytestmark = pytest.mark.model
 
 PROMPTS = [
     "The capital of France is",
@@ -110,12 +106,17 @@ def compare(tokenizer, got_all, want_all) -> int:
     return num_exact
 
 
-def main(
-    model: Annotated[str, typer.Option(help="HF model id or local path.")] = "Qwen/Qwen3-0.6B",
-    max_new_tokens: Annotated[int, typer.Option(help="Most tokens to generate per prompt.")] = 32,
-    batched_prefill: Annotated[bool, typer.Option(help="Exercise 2.")] = False,
-    page_size: Annotated[int, typer.Option(help="Exercise 4.")] = 1,
-    lazy_free: Annotated[bool, typer.Option(help="Exercise 5.")] = False,
+@pytest.mark.parametrize(
+    "batched_prefill, page_size, lazy_free",
+    [(False, 1, False), (True, 64, True)],
+    ids=["default", "options"],
+)
+def test_matches_hf(
+    model: str,
+    max_new_tokens: int,
+    batched_prefill: bool,
+    page_size: int,
+    lazy_free: bool,
 ):
     """Compare greedy decoding over the KV pool with HF generate, prompt by prompt."""
     tokenizer = AutoTokenizer.from_pretrained(model)
@@ -127,7 +128,7 @@ def main(
         model,
         max_running_requests=len(PROMPTS),
         max_total_tokens=pool_size,
-        options=ExerciseOptions(
+        options=EngineOptions(
             batched_prefill=batched_prefill,
             page_size=page_size,
             lazy_free=lazy_free,
@@ -159,19 +160,12 @@ def main(
         total_exact += compare(tokenizer, got_all, want_all)
         memory_mb.append(runner.gpu_memory_mb())
 
-        if runner.allocator.available_size() != pool_size:
-            raise SystemExit(
-                f"FAIL: leaked slots, {runner.allocator.available_size()}/{pool_size} are free."
-            )
+        free = runner.allocator.available_size()
+        assert free == pool_size, f"leaked slots, {free}/{pool_size} are free"
         print(f"all {pool_size} slots free, GPU memory {memory_mb[-1]:.1f} MB")
 
     num_expected = len(PROMPTS) * NUM_PASSES
     print(f"\n{total_exact}/{num_expected} prompts match token-for-token.")
-    if memory_mb[-1] > memory_mb[0]:
-        raise SystemExit(f"FAIL: GPU memory grew: {memory_mb} MB.")
-    if runner.device == "cpu" and total_exact != num_expected:
-        raise SystemExit("FAIL: on CPU (float32) all prompts should match.")
-
-
-if __name__ == "__main__":
-    typer.run(main)
+    assert memory_mb[-1] <= memory_mb[0], f"GPU memory grew: {memory_mb} MB"
+    if runner.device == "cpu":
+        assert total_exact == num_expected, "on CPU (float32) all prompts should match"
