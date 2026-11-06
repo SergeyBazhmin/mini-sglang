@@ -90,8 +90,7 @@ Check yourself before reading on:
 ## How the code works
 
 The process layout, the loop and the pools are as in M3. This section covers what
-the tree adds, by component. [`REQUEST_PATH.md`](REQUEST_PATH.md) follows one request
-through all of it, line by line, with a worked example.
+the tree adds, by component.
 
 ### The tree (`radix_cache.py`)
 
