@@ -45,6 +45,77 @@ the server does plain continuous batching, prefill first.
   tokens into one sequence and gives the attention kernel per-request offsets
   and KV slot indices. That needs our own KV pool (M3) and attention (M5).
 
+## How the code works
+
+The main process and the detokenizer are as in M1 (see its README). The scheduler
+now has two layers: `scheduler.py` decides *which* requests run, and
+`model_runner.py` knows *how* to run them. Tests drive `ModelRunner` directly
+with `FakeReq`, and `Scheduler` with a fake runner.
+
+### The scheduler loop (`Scheduler.event_loop`)
+
+```python
+ingest_requests(block=idle)
+batch = get_next_batch_to_run()      # a ScheduleBatch: reqs + ForwardMode
+next_token_ids = run_batch(batch)    # ModelRunner.forward
+process_batch_result(batch, next_token_ids)
+```
+
+State: `waiting_queue` (not started) and `running_batch` (prefilled, decoding).
+
+- **`get_next_batch_to_run`.** Calls `get_new_batch_prefill` first. If it returns
+  a batch, that's an **EXTEND** step. Otherwise, if anything is running, it's a
+  **DECODE** step over the whole `running_batch`. With `--decode-first`, any
+  running request means DECODE, so new requests wait for the batch to drain.
+- **`get_new_batch_prefill`.** Takes requests from the queue head while
+  `running + new < max_running_requests` and the prompt tokens stay under
+  `max_prefill_tokens`. The first request is always admitted, even if it's over
+  the token limit alone, or it would wait forever.
+- **`run_batch`** calls `model_runner.forward(reqs, is_extend)`, which returns
+  one token id per request.
+- **`process_batch_result`.** Appends each token and runs `check_finished`
+  (skipping requests aborted mid-step), sends one `BatchTokenIDOut` for the whole
+  batch (`stream_output`), drops finished requests' K/V, and updates the batch:
+  after EXTEND the survivors *join* `running_batch`, after DECODE the survivors
+  *become* `running_batch`. This is where requests join and leave every step.
+- **`abort_request`** removes a waiting request, or marks a running one
+  `"abort"`. It still runs one more step, but `process_batch_result` drops its
+  token and the final message frees the detokenizer's state.
+
+### The forward pass (`ModelRunner`)
+
+Each `Req` keeps its own K/V as one tensor, `req.kv`, shaped
+`[tokens, layers, 2, kv_heads, head_dim]`. It covers `input_ids + output_ids[:-1]`:
+the newest sampled token hasn't been through the model yet, it's the input of the
+next decode step.
+
+- **`forward_extend`** right-pads the prompts into a `[batch, max_len]` tensor
+  (`pad_sequence`) and builds an attention mask from the lengths. It runs only
+  the decoder with a fresh `DynamicCache`, then applies the LM head to each
+  row's *last real* token (`hidden[i, lens[i] - 1]`), not to every position.
+  Finally `_stack_cache` turns HF's per-layer cache into one tensor, and each
+  request gets its slice without the padding.
+- **`forward_decode`** left-pads every `req.kv` to the longest one, so each
+  request's newest token sits in the last column. `_to_cache` rebuilds an HF
+  `DynamicCache` from that tensor. The input is each request's last token, at
+  position `len(req.kv)` (its real position, not `max_len`), with a mask that
+  hides the left padding. After the call, the last column of the cache is
+  `torch.cat`-ed onto every `req.kv`. That copy of everything, every step, is
+  what M3 removes. `DecodeTimer` splits the step into `pad`, `model` and `cat`
+  for `copy_cost.py`.
+- **`sample`** does the whole batch at once: per-row temperature and top-p,
+  with rows at temperature 0 taking the argmax.
+
+### The tools
+
+- `bench.py`: async load generator over the OpenAI client. `--concurrency`
+  caps requests in flight with a semaphore, `--min-tokens` gives each request
+  its own `max_tokens`. It reads token counts from the usage chunk the server
+  now sends when asked (`stream_options.include_usage`).
+- `sweep.py`: calls `run_bench` at concurrency 1, 2, 4, …, 64 and plots it.
+- `copy_cost.py`: drives `ModelRunner` directly with `FakeReq`s and the
+  `DecodeTimer` on, so EOS can't end a run early.
+
 ## Run (GPU machine)
 
 From the repo root:

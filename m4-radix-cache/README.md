@@ -87,6 +87,107 @@ Check yourself before reading on:
 - **Eviction before retraction.** Idle cache goes first. A running request loses its
   work only when nothing else can.
 
+## How the code works
+
+The process layout, the loop and the pools are as in M3. This section covers what
+the tree adds, by component. [`REQUEST_PATH.md`](REQUEST_PATH.md) follows one request
+through all of it, line by line, with a worked example.
+
+### The tree (`radix_cache.py`)
+
+A `TreeNode` is an edge: `key` is a run of token ids (an `array("q")`, so slices
+compare in C), `value` is the slot of each of those tokens, and `children` is keyed
+by the child's first token (first page, with pages). It also has `lock_ref`,
+`last_access` (a logical clock, so runs are deterministic) and `hit_count`.
+`RadixCache` keeps `evictable_size`, `protected_size` and the set of
+`evictable_leaves`.
+
+- **`match_prefix(ids)`** walks from the root. At each child it counts matching
+  tokens (`match_len_loop`, or `match_len_gallop` with `--fast-match`), rounded down
+  to whole pages. If the match ends inside a node, **`_split`** cuts the node in two
+  there, so a lock can cover exactly what's used. Returns the concatenated slots and
+  the last node.
+- **`insert(ids, slots)`** walks the same way, then adds one new leaf holding
+  `slots[matched:]`. It returns `matched`: those slots were already in the tree, so
+  the caller still owns its own copies and must free them.
+- **`inc_lock_ref` / `dec_lock_ref`** walk from a node up to the root. A node going
+  from 0 to 1 locks moves its tokens from evictable to protected. `inc_lock_ref`
+  returns how many, because the scheduler must pay for them.
+- **`evict(n)`** builds a heap of unlocked leaves ordered by the eviction policy
+  (`EVICTION_POLICIES`: LRU, or LFU by `hit_count`), frees their `value` to the
+  allocator and removes them. A parent that becomes an unlocked leaf joins the heap.
+  With `trim_leaves` (`--cache-retracted`) it splits a leaf and frees only its end.
+- **Per-request wrappers.** `match_req` matches `input_ids + output_ids` *minus the
+  last token* (one token must run to produce logits) and stores `prefix_len`,
+  `prefix_slots`, `last_node` on the request. `lock_req` / `unlock_req` lock or
+  unlock that path.
+- **`checkpoint(req)`** hands a running request's K/V to the tree: it inserts the
+  whole pages of the row, and if another request inserted the same tokens first
+  (same prefill batch), frees its own copies and points its row at the tree's
+  slots. Then it moves its lock to the new, longer path and raises
+  `cache_protected_len`.
+
+### Admission (`Scheduler.get_new_batch_prefill`)
+
+For the queue head, in order:
+
+1. `_sort_waiting_queue`: only with `--schedule-policy lpm`, sorts the queue by
+   match length.
+2. `tree.match_req(req)`, at the last moment, because the tree changes while a
+   request waits.
+3. `_shares_with_batch`: only with `--in-batch-dedup`. A scratch tree holds this
+   batch's prompts; a request with a short cache hit but a long match in there
+   stops admission and runs next step as a cache hit.
+4. The prefill-size check, now on `len(input + output) - prefix_len`.
+5. `locked = tree.lock_req(req)`, then `reserved = remaining_kv_tokens(...)`, which
+   now leaves out `prefix_len`. If `reserved + locked` doesn't fit, unlock and stop.
+
+The budget itself (`_get_rem_tokens`) is now `free + evictable − reserved by running
+requests`: idle cache counts as free.
+
+### Allocation (`ModelRunner`)
+
+- **`ensure_free(n)`** evicts `n − free` tokens from the tree when the free list is
+  short. `_prepare_extend` and `update_running_batch` call it before allocating.
+- **`_prepare_extend`** allocates only the uncached tail. The row gets
+  `prefix_slots` at `[:prefix_len]` (no copy, no compute) and fresh slots after.
+  `input_ids` and `positions` in the `ForwardBatch` cover only the tail, starting at
+  `prefix_len`, and the new `prefix_lens` field tells attention where they sit.
+  Sets `cache_protected_len = prefix_len`.
+- **`free_req(req, cache=True)`** first `checkpoint`s the request (so its output
+  is cached too, for the next chat turn), then frees only
+  `row[cache_protected_len:kv_allocated_len]` (the partial last page) and unlocks.
+  With `cache=False` (abort, or retraction without `--cache-retracted`) it skips the
+  checkpoint and the tree keeps only what it already had.
+
+### Attention (`attention.py`)
+
+With a prefix there are fewer queries than keys. `_run_extend` gathers the whole row
+`[:seq_len]` and builds a `[extend_len, seq_len]` mask where query *i* sits at
+position `prefix_len + i`. `_run_extend_batched` does the same in a padded batch.
+Decode is unchanged.
+
+### Results and the rest of the scheduler
+
+- `process_batch_result` calls `tree_cache.checkpoint(req)` right after prefill for
+  every request still running, so later arrivals hit its prompt, and
+  `free_req(cache=finish_reason != "abort")` for finished ones.
+- `update_running_batch` loops on `ensure_free(decode_slots_needed(...))`, so it
+  evicts before it retracts.
+- `flush_cache` (from `POST /flush_cache` → `FlushCacheReq`) evicts everything
+  evictable, only when nothing is running or waiting.
+- The logs add `#cached-token`, `cache hit rate` and `cache usage`; `token usage` no
+  longer counts evictable cache.
+
+### Testing without a model (`fake_runner.py`)
+
+`FakeRunner` subclasses `ModelRunner` with the real allocator, table and tree but no
+model. Its "K/V" is a dict from slot to a hash of all tokens up to that position,
+which is exactly what real K/V depends on. Each forward writes the hash for new
+positions and checks it for every position it only reads, so a slot shared by
+mistake fails at once. `test_scheduler.py` and `cache_sim.py` run the real
+`Scheduler` on it.
+
 ## What did NOT get better
 
 - **A burst gets nothing.** Requests in one prefill batch all find an empty cache, so
@@ -278,22 +379,3 @@ SGLang flushes only when idle because it resets the pools outright, and running
 requests hold slots in them. Ours only evicts, so it would be safe mid-flight, and
 locked paths would stay. The rule is kept so that "the cache is empty" is true after
 a flush.
-
-## How far this was tested
-
-Run on a machine with 4 CPUs and no GPU:
-
-- `test_radix_cache.py`, `test_memory_pool.py`, `test_scheduler.py` and
-  `test_attention.py` pass. The stress test runs 60 random setups over all the options.
-- `cache_sim.py` and `match_cost.py` gave the numbers above.
-- 14 bugs were injected on purpose, one at a time, such as a split that forgets locks,
-  an uncharged lock, and a release that frees the shared prefix. The model-free tests
-  caught all 14.
-- `test_prefix_output.py` and `test_batching.py` (10 of 10 prompts token-exact,
-  with and without flags) passed on a tiny **random** Qwen3 on CPU, built locally.
-
-**Not done: anything with a real model or a GPU.** `Qwen/Qwen3-0.6B` hasn't been run,
-`prefix_bench.py` has no recorded result, and `client.py` wasn't run. So there are
-no TTFT numbers yet, and all expected TTFT results above are predictions. `/flush_cache`
-and rising `cache hit rate` were seen once, on the tiny model, with `bench.py`. Write
-your numbers here.

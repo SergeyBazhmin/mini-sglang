@@ -20,6 +20,87 @@ What v0 does **not** do yet:
 - **No batching.** The scheduler finishes one request before starting the next. That comes in M2.
 - **The KV cache is HF's `DynamicCache`, one per request.** Our own memory pool comes in M3.
 
+## How the code works
+
+### Startup (`server.py: main`)
+
+1. `PortArgs.new()` makes a temp dir and three `ipc://` addresses, one per
+   *receiving* process. Receivers bind, senders connect (`get_socket`). High-water
+   marks are 0, so ZMQ never drops a message.
+2. The scheduler and detokenizer start as `spawn` processes (a forked child can't
+   initialize CUDA). `main` blocks on a pipe until `run_scheduler_process` sends
+   `"ready"`, i.e. until the model is loaded, or a traceback if loading failed.
+3. `TokenizerManager` is built, then uvicorn serves `build_app(...)`. The app's
+   `lifespan` starts `handle_loop` as a background task.
+
+### One request
+
+**Main process, in.** `chat_completions` calls `tokenize_chat`, which renders the
+chat template to text and then tokenizes it, so the engine only ever sees token
+ids. `generate_request` is an async generator:
+
+- it makes a `rid` (the only key all three processes share) and a `ReqState`
+  with an `asyncio.Event` and an `out_list`,
+- sends a `TokenizedGenerateReq` to the scheduler,
+- then loops: wait on the event, take `out_list`, yield each output, return once
+  `state.finished`.
+
+For `stream: true` the generator is wrapped by `_stream_chunks`, which turns
+each output into an OpenAI SSE chunk. Otherwise the endpoint drains it into one
+JSON response.
+
+**Scheduler process.** `event_loop` is the shape every later chapter keeps:
+
+```
+ingest_requests  ->  pick work  ->  run_step  ->  stream_output
+```
+
+- `ingest_requests(block=idle)` blocks on the socket only when there's nothing
+  to run, then drains everything pending with `NOBLOCK`. A `TokenizedGenerateReq`
+  becomes a `Req` in `waiting_queue`. An `AbortReq` goes to `abort_request`.
+- Pick work: if nothing is running, pop the queue head into `running_req`.
+  One request at a time.
+- `run_step` is one forward pass. If `req.past_key_values` is `None` it's
+  **prefill**: the whole prompt goes in. Otherwise it's **decode**: only
+  `output_ids[-1]` goes in, and HF's cache supplies the rest. `sample` picks a
+  token (greedy at temperature 0, otherwise temperature + top-p), it's appended
+  to `output_ids`, and `check_finished` sets `finish_reason` to `stop` (EOS) or
+  `length`. A finished request drops its cache at once.
+- `stream_output` sends `output_ids[num_sent:]` as a `BatchTokenIDOut` (batch-shaped
+  already, with one entry). With `--stream-interval N` it skips sending until N
+  tokens are pending, except for the first token and the final message. The
+  first message also carries the last 5 prompt tokens (`prompt_tails`) as
+  decoding context.
+
+**Detokenizer process.** `handle_batch_token_id_out` keeps a `DecodeStatus` per
+`rid`, created on the first message and seeded with the prompt tail:
+
+- `decode_ids[surr_offset:read_offset]` is text already sent, kept only as
+  context. It decodes that window and the window plus the new ids, and the
+  difference is the new text.
+- Clean new text is sent and the window slides forward.
+- New text ending in `�` means a UTF-8 character is split across tokens. The
+  offsets stay put so the next token retries, and only `printable_prefix` (up to
+  the last space, newline or CJK character) goes out. `sent_len` remembers how
+  much of it was sent.
+- On the final message it flushes everything and deletes the state.
+
+**Main process, out.** `handle_loop` is one coroutine for all requests. For each
+entry of a `BatchStrOut` it appends to that rid's `out_list`, marks it finished
+if there's a `finish_reason`, and sets the event, which wakes `generate_request`.
+On the way out `generate_request` calls `log_timing` (tokenize time, TTFT, decode
+tok/s).
+
+### Abort
+
+If the client disconnects, Starlette cancels the response. `_stream_chunks`'s
+`finally` closes the inner generator at once, and `generate_request`'s `finally`
+sees `not state.finished` and sends `AbortReq`. In the scheduler,
+`abort_request` removes a waiting request outright (the detokenizer never saw
+it), or sets `finish_reason = "abort"` on the running one. The loop then skips
+`run_step` for it, and `stream_output` sends the final message so the
+detokenizer frees its state.
+
 ## Run (GPU machine)
 
 From the repo root (`uv sync` once, see the root README):

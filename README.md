@@ -4,7 +4,8 @@ A toy LLM serving engine built step by step to learn how SGLang works.
 Each chapter rebuilds one SGLang idea in a small form. The docstrings point to the real SGLang code.
 
 Each chapter is a self-contained folder that starts as a copy of the previous one,
-so you can diff two chapters to see exactly what changed.
+so you can diff two chapters to see exactly what changed. Each chapter's README has a
+**How the code works** section that walks through that chapter's code, function by function.
 
 | chapter | topic |
 |---|---|

@@ -76,6 +76,109 @@ Check yourself before reading on:
   So `_prepare_decode`'s allocation can't fail, and a request waits in the queue
   instead of taking the server down.
 
+## How the code works
+
+The main process, the detokenizer and the scheduler loop are as in M2. What
+changed is where K/V lives and how the scheduler budgets for it.
+
+### Startup: building the pools (`ModelRunner.__init__`)
+
+1. Load the HF model. Only Qwen3 without sliding window is accepted.
+2. Size the pool. `cell_size` is the bytes of one token's K+V over all layers.
+   `--max-total-tokens` sets the size directly; otherwise
+   `_size_from_free_memory` takes `mem_fraction_static` of the GPU memory that's
+   free *after* loading the weights, divided by `cell_size` (8192 on CPU). It's
+   rounded down to whole pages, and `max_context_len` is capped by it.
+3. Build the three objects in `memory_pool.py`:
+   - `TokenToKVPool`: per layer, `k_buffer` and `v_buffer` of shape
+     `[size + 1, kv_heads, head_dim]`, allocated once. Slot 0 is a dummy.
+   - `ReqToTokenPool`: the `req_to_token` table, `[max_running_requests,
+     max_context_len]` ints, plus a Python list of free rows.
+   - `TokenAllocator`: `free_pages`, a tensor of free slots (or of page starts,
+     with `--page-size`). `alloc(n)` slices pages off the front, `free(slots)`
+     concatenates them back. It never touches K/V.
+4. Swap every layer's `self_attn` for a `PoolAttention` that takes over the
+   original projections and norms, and holds that layer's buffers and the table.
+
+### One step (`ModelRunner.forward`)
+
+```
+_prepare_extend / _prepare_decode  ->  ForwardBatch
+_run_layers(ForwardBatch)          ->  hidden states, [num_tokens, hidden]
+lm_head(hidden[last token of each request])  ->  sample
+```
+
+The batch is **flat**: all tokens of all requests in one `[num_tokens]`
+sequence. `ForwardBatch` says how it splits: `positions`, `out_cache_loc` (the
+slot each token's K/V goes to), `req_pool_indices` (table rows), `seq_lens` and
+`extend_lens`. The last token of request *i* is at `extend_lens.cumsum()[i] - 1`.
+
+- **`_prepare_extend`** concatenates `input_ids + output_ids` for each request
+  (`output_ids` is non-empty only after a retraction), allocates one slot per
+  token in a single `alloc` call, takes a table row per request, and writes
+  `req_to_token[row, :len] = slots`. Sets `kv_allocated_len`.
+- **`_prepare_decode`** works on one new token per request, at position
+  `seq_len - 1`. Its slot is guessed as "last slot + 1", which is right inside a
+  page; requests at a page boundary (`position % page_size == 0`, every step at
+  page size 1) get a fresh page from the allocator instead. One table entry per
+  request is written. That's all the memory work a decode step does.
+- **`_run_layers`** replays `Qwen3Model.forward` by hand: embed, rotary
+  embeddings from `positions`, every decoder layer with `forward_batch=fb`
+  passed through to attention, final norm. HF's masks and cache are bypassed.
+
+### Attention (`PoolAttention.forward`)
+
+1. Project Q/K/V for the flat batch, apply `q_norm`/`k_norm` and rope.
+2. **Write first**: `k_buffer[out_cache_loc] = k`, same for V. A token attends
+   to itself, so its own K/V must be in the pool before the read.
+3. Read and attend:
+   - `_run_extend` (default prefill): a loop over requests. For each, gather
+     `k_buffer[req_to_token[row, :len]]` and run causal SDPA.
+   - `_run_extend_batched` (`--batched-prefill`): one SDPA call over a padded
+     `[batch, max_len]` query, with a mask that is causal *and* inside the
+     request.
+   - `_run_decode`: one query per request. Gather `req_to_token[rows, :max_len]`
+     as a `[batch, max_len]` block of slots (stale entries past each length are
+     valid indices), then mask them out by `seq_lens`. `GatherTimer` times the
+     gather for `read_cost.py`.
+
+### Freeing (`ModelRunner.free_req`)
+
+Frees `req_to_token[row, :kv_allocated_len]` to the allocator and the row to
+`ReqToTokenPool`, then clears `req_pool_idx`. The K/V stays where it is and gets
+overwritten by the next owner. Calling it on a request with no row raises.
+
+### The scheduler's budget (`scheduler.py`)
+
+- **`handle_generate_request`** rejects a prompt `>= max_context_len` right
+  away (streamed back as `"abort"`), and caps `max_new_tokens` so that prompt +
+  output always fits. Without that, a too-big request would block the queue head
+  forever.
+- **`Req.remaining_kv_tokens(ratio, page_size)`** is how many slots a request
+  may still need: for a waiting request, prefill plus `(max_new - 1) * ratio`;
+  for a running one, the pages its remaining output may cross into.
+- **`_get_rem_tokens`** = free slots − Σ `remaining_kv_tokens` of running
+  requests.
+- **`get_new_batch_prefill`** admits the queue head only if its reservation fits
+  in what's left, subtracting as it goes. FIFO: if the head doesn't fit, nothing
+  behind it runs either, so large requests can't starve.
+- **`update_running_batch`** runs before every decode step. While the step needs
+  more slots than are free (`decode_slots_needed`: requests about to start a
+  page), it retracts the request with the most work left: `free_req`, then back
+  to the *head* of the queue with `output_ids` and `num_sent` kept. It re-prefills
+  `input + output` later, and the client sees nothing. This only fires with
+  `--new-token-ratio < 1`; at 1 every slot was reserved up front.
+- `process_batch_result` calls `free_req` for finished requests; the decode log
+  line adds `token usage`, `page waste`, `#retracted` and `gpu mem`.
+
+### Allocator options (`TokenAllocator`)
+
+- `--page-size N`: `free_pages` holds page starts, `alloc` expands them to all
+  slots of each page, `free` keeps only each page's first slot.
+- `--lazy-free`: `free` appends to `released` (a clone, see M4's "A bug from
+  M3"), and `merge_released` concatenates them only when `alloc` runs short.
+- `--check-double-free`: an `is_free` bit per page, checked on every free.
+
 ## What did NOT get better
 
 The M2 notes say M3 removes the copying. That's only half true:
